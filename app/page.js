@@ -122,6 +122,29 @@ const box = {
   boxSizing: "border-box",
 };
 
+/* One row of the thread. Sources (from a Routine 5 answer) fold under a
+   plain disclosure, same as before — just no longer a separate block. */
+function Msg({ r }) {
+  return (
+    <div className={`td-msg ${r.you ? "td-you" : ""}`}>
+      <div className="td-msg-who">{r.who}</div>
+      <div className="td-msg-body">{r.body}</div>
+      {r.sources?.length > 0 && (
+        <details style={{ marginTop: 6 }}>
+          <summary style={{ cursor: "pointer", color: "var(--text-3)", fontSize: 12 }}>
+            Where this came from ({r.sources.length})
+          </summary>
+          <ul style={{ margin: "6px 0 0", paddingLeft: 18, color: "var(--text-3)", fontSize: 12.5, lineHeight: 1.6 }}>
+            {r.sources.map((s, j) => (
+              <li key={j}>{s}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </div>
+  );
+}
+
 function Spine({ breakdown, total }) {
   if (!breakdown || !total) return null;
   return (
@@ -157,14 +180,16 @@ export default function Page() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState(null);
-  const [draft, setDraft] = useState("");
   const [magicText, setMagicText] = useState("");
   const [magicBusy, setMagicBusy] = useState(false);
-  const [magicAck, setMagicAck] = useState(null); // { text, shape } — shown immediately, before the thread refresh lands
   const [asking, setAsking] = useState(false);
-  // An option he has clicked but not yet confirmed. The second step lives
-  // under it, so the wording being edited is tied to the choice being made.
-  const [pending, setPending] = useState(null);
+  // Which predicted option is loaded into the shared box, if any — not a
+  // separate editor per option anymore. Selecting one just populates this
+  // one input; nothing else changes shape.
+  const [selected, setSelected] = useState(null);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [olderOpen, setOlderOpen] = useState(false);
+  const inputRef = useRef(null);
   // Which ticket is open right now. Async work started for one ticket must
   // never write its result into another — switching cards mid-poll is normal.
   const openId = useRef(null);
@@ -193,10 +218,10 @@ export default function Page() {
     setDetail(null);
     setMsg(null);
     setAsking(false);
-    setPending(null);
+    setSelected(null);
     setMagicText("");
-    setMagicAck(null);
-    setDraft(""); // per-option now, not per-ticket — set correctly when an option is opened, not here
+    setDetailsOpen(false);
+    setOlderOpen(false);
     if (!sel) return;
     const id = sel.id;
     fetch(`/api/issue/${id}`)
@@ -277,28 +302,68 @@ export default function Page() {
     const fresh = await r.json();
     if (openId.current !== id) return null; // a different card is open now
     setDetail(fresh);
-    // Draft is per-option now, not per-ticket. If an option panel is open,
-    // re-resolve its draft from the fresh data instead of resetting to the
-    // ticket's legacy field — that field belongs to whichever option it
-    // belongs to, not necessarily the one currently open.
-    if (pending) {
-      const fp = fresh.parsed;
-      const fd = fp?.drafts?.[String(pending.n)] || (fp?.draft ? { text: fp.draft } : null);
-      setDraft(fd?.text || "");
-    }
     return fresh;
+  }
+
+  function growInput() {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 220) + "px";
+  }
+  function onMagicInput(e) {
+    setMagicText(e.target.value);
+    requestAnimationFrame(growInput);
+  }
+
+  /* Selecting a predicted option loads its draft into the ONE shared box —
+     not a separate editor per option. This was a real, confirmed fix: an
+     earlier version spawned its own editor per option, quietly
+     reintroducing the second text surface the whole magic box exists to
+     eliminate. */
+  function selectOption(n, draftText) {
+    setSelected(n);
+    setMagicText(draftText || "");
+    requestAnimationFrame(growInput);
+  }
+  function clearSelection() {
+    setSelected(null);
+    setMagicText("");
+    requestAnimationFrame(growInput);
+  }
+
+  /* Confirming a SELECTED option is a known, already-classified action —
+     it goes straight to the existing choose/EXEC path, never back through
+     the classifier. Only free text (nothing selected) needs classifying. */
+  async function sendFromBox() {
+    if (selected != null) {
+      const originalDraft = p?.drafts?.[String(selected)]?.text || "";
+      const edited = magicText.trim() !== originalDraft.trim();
+      const n = selected;
+      const draftToSend = edited ? magicText : null;
+      clearSelection();
+      await act("choose", { n, draft: draftToSend });
+      return;
+    }
+    await submitMagic();
+  }
+
+  /* Tapping a clarification choice is the same as typing it — goes through
+     the same classification path, not a special case. */
+  function answerClarify(choiceText) {
+    setMagicText(choiceText);
+    submitMagic(choiceText);
   }
 
   /* The magic box. Classify-then-execute already happened server-side by
      the time this returns — this just shows the result and, for a new
      option, lands straight on its editable draft rather than making a
      second click find it. */
-  async function submitMagic() {
-    const text = magicText.trim();
+  async function submitMagic(overrideText) {
+    const text = (overrideText != null ? overrideText : magicText).trim();
     if (!text || !sel) return;
     setMagicText("");
     setMagicBusy(true);
-    setMagicAck(null);
     try {
       const r = await fetch("/api/magic", {
         method: "POST",
@@ -307,21 +372,13 @@ export default function Page() {
       });
       const result = await r.json();
       if (result.error) throw new Error(result.error);
-      setMagicAck({ text: result.acknowledgment, shape: result.shape });
       const fresh = await refreshDetail(sel.id);
       await load(); // labels may have changed (buddy-added-option, buddy-parked, buddy-done)
 
-      if (result.shape === "new_option" && fresh?.parsed) {
-        const n = result.newOptionNumber;
+      if ((result.shape === "new_option" || result.shape === "modifier") && fresh?.parsed) {
+        const n = result.newOptionNumber || result.modifiedOptionNumber;
         const d = fresh.parsed.drafts?.[String(n)];
-        setPending({ n, text: "" });
-        setDraft(d?.text || "");
-      }
-      if (result.shape === "modifier" && fresh?.parsed) {
-        const n = result.modifiedOptionNumber;
-        const d = fresh.parsed.drafts?.[String(n)];
-        setPending({ n, text: "" });
-        setDraft(d?.text || "");
+        selectOption(n, d?.text || "");
       }
       if (result.shape === "needs_research") {
         // This is the actual fold-in of "Tell me more" into this one box —
@@ -329,11 +386,10 @@ export default function Page() {
         // instead of pointing at a separate button. Same polling UI that
         // already existed, just reached from here instead of its own entry
         // point.
-        setMagicAck(null);
         ask(text);
       }
     } catch (e) {
-      setMagicAck({ text: `Couldn't process that: ${e.message}`, shape: "error" });
+      setMsg({ ok: false, text: `Couldn't process that: ${e.message}` });
     } finally {
       setMagicBusy(false);
     }
@@ -377,35 +433,40 @@ export default function Page() {
   }
 
   const p = detail?.parsed;
-  // One real timeline, not two stacked blocks. This is the actual fix for
-  // "the order on screen doesn't match when things happened" — p.thread
-  // (Q&A) and p.magicThread (everything else) used to render as two
-  // separate, fixed-position sections regardless of real timestamps. No
-  // overlap between the two sources to worry about: a genuine question
-  // only ever lands in p.thread, since needs_research deliberately skips
-  // writing to p.magicThread — see the magic route.
+  // One real timeline, not two stacked blocks. p.thread (Q&A) and
+  // p.magicThread (everything else) merge and sort by real timestamp. No
+  // overlap between the two sources: a genuine question only ever lands in
+  // p.thread, since needs_research deliberately skips writing to
+  // p.magicThread — see the magic route.
   const history = useMemo(() => {
     const rows = [];
     for (const t of p?.thread || []) {
       rows.push({
         at: t.at,
-        label: t.role === "you" ? "YOU ASKED" : "ANSWER",
-        color: t.role === "you" ? SIGNAL : COOL,
+        who: t.role === "you" ? "You asked" : "Triage",
+        you: t.role === "you",
         body: t.body || "What is this about, and does it matter to me?",
         sources: t.sources,
       });
     }
     for (const m of p?.magicThread || []) {
-      const style = {
-        you: { label: "YOU", color: MUTE },
-        question: { label: "ASKING YOU", color: SIGNAL },
-        resolved: { label: "RESOLVED", color: LIVE },
-        snoozed: { label: "PARKED", color: MUTE },
-      }[m.kind] || { label: m.kind.toUpperCase(), color: MUTE };
-      rows.push({ at: m.at, label: style.label, color: style.color, body: m.body });
+      const who = { you: "You", question: "Triage", resolved: "Resolved", snoozed: "Parked" }[m.kind] || m.kind;
+      rows.push({ at: m.at, who, you: m.kind === "you", body: m.body, choices: m.choices || [], kind: m.kind });
     }
     return rows.sort((a, b) => new Date(a.at) - new Date(b.at));
   }, [p?.thread, p?.magicThread]);
+
+  // A clarification is pending only if the very last thing in the thread is
+  // an unanswered question with choices. Answering it writes a newer entry,
+  // which naturally clears this — no separate flag to keep in sync.
+  const pendingClarify = useMemo(() => {
+    const last = history[history.length - 1];
+    return last && last.kind === "question" && last.choices?.length ? last : null;
+  }, [history]);
+
+  const RECENT = 3;
+  const olderRows = history.slice(0, Math.max(0, history.length - RECENT));
+  const recentRows = history.slice(Math.max(0, history.length - RECENT));
   const accent =
     tab === "proposals" || tab === "unsure" ? COOL : tab === "drops" ? INK_3 : detail?.issue?.priority === 1 ? ALERT : detail?.issue?.priority === 2 ? SIGNAL : LIVE;
 
@@ -542,260 +603,166 @@ export default function Page() {
 
               {detail?.issue && (
                 <>
-                  <div style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
-                    <span style={{ fontSize: 10, letterSpacing: ".12em", color: MUTE, fontWeight: 700 }}>{detail.issue.key}</span>
-                    <h2 style={{ margin: 0, fontSize: 16, lineHeight: 1.4, fontWeight: 600, flex: 1 }}>{detail.issue.title}</h2>
-                    <a href={detail.issue.url} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: MUTE }}>
-                      Linear ↗
+                  <h1 className="td-h1">{detail.issue.title}</h1>
+
+                  {/* The briefing — 1B's own context, as written. The one
+                      accent at rest is the marker beside it. */}
+                  <div className="td-state">
+                    <div className="td-state-mark" />
+                    <div className="td-state-text">{p?.context || "No context has been written for this ticket yet."}</div>
+                  </div>
+
+                  {/* Three quiet affordances, nothing louder. "Tell me more"
+                      is first-class here, not buried in the input. */}
+                  <div className="td-under">
+                    <button className="td-quiet" disabled={asking} onClick={() => ask("")}>
+                      {asking ? "Looking into it…" : "Tell me more"}
+                    </button>
+                    <button className="td-quiet" onClick={() => setDetailsOpen((v) => !v)}>
+                      {detailsOpen ? "Hide" : "Why it's ranked here"}
+                    </button>
+                    <a className="td-quiet" href={detail.issue.url} target="_blank" rel="noreferrer" style={{ textDecoration: "none" }}>
+                      Open in Linear ↗
                     </a>
                   </div>
 
-                  <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginTop: 10 }}>
-                    {detail.issue.labels.map((l) => (
-                      <span key={l} style={{ fontSize: 9, letterSpacing: ".06em", color: MUTE, border: `1px solid ${INK_3}`, borderRadius: 2, padding: "2px 6px" }}>
-                        {l}
-                      </span>
-                    ))}
+                  <div className={`td-details ${detailsOpen ? "open" : ""}`}>
+                    <div className="td-labels">
+                      <span className="td-label">{detail.issue.key}</span>
+                      {detail.issue.labels.map((l) => (
+                        <span key={l} className="td-label">{l}</span>
+                      ))}
+                    </div>
+                    <Spine breakdown={p?.breakdown} total={p?.score} />
+                    {p?.rank && (
+                      <div className="td-rank">
+                        {p.rank.position} of {p.rank.of} in {p.rank.band}
+                        {p.rank.reason ? ` — ${p.rank.reason}` : ""}
+                      </div>
+                    )}
                   </div>
 
-                  <Spine breakdown={p?.breakdown} total={p?.score} />
-
-                  {p?.rank && (
-                    <p style={{ margin: "8px 0 0", fontSize: 12, color: MUTE, lineHeight: 1.5 }}>
-                      <span style={{ color: SIGNAL, fontWeight: 700 }}>
-                        {p.rank.position} of {p.rank.of} in {p.rank.band}
-                      </span>
-                      {p.rank.reason ? ` — ${p.rank.reason}` : ""}
-                    </p>
-                  )}
-
-                  {p?.context && (
-                    <p style={{ margin: "14px 0 0", fontSize: 13, lineHeight: 1.6, color: "#B9C6D2", whiteSpace: "pre-wrap" }}>{p.context}</p>
-                  )}
-
-                  {tab === "proposals" && (
-                    <div style={{ display: "flex", gap: 6, marginTop: 16 }}>
-                      <button disabled={busy} onClick={() => act("proposal", { approve: true })} style={btn(LIVE, INK)}>
-                        Approve
-                      </button>
-                      <button disabled={busy} onClick={() => act("proposal", { approve: false })} style={btn("transparent", MUTE, `1px solid ${INK_3}`)}>
-                        Not yet
-                      </button>
+                  {/* The thread — a real conversation, visible. Recent
+                      exchanges show; older ones fold above. */}
+                  {(history.length > 0 || magicBusy) && (
+                    <div className="td-thread">
+                      {olderRows.length > 0 && (
+                        <>
+                          <button className="td-earlier" onClick={() => setOlderOpen((v) => !v)}>
+                            {olderOpen ? "Hide earlier" : `Earlier in this thread (${olderRows.length})`}
+                          </button>
+                          <div className={`td-older ${olderOpen ? "open" : ""}`}>
+                            {olderRows.map((r, i) => <Msg key={`o${i}`} r={r} />)}
+                          </div>
+                        </>
+                      )}
+                      {recentRows.map((r, i) => <Msg key={`r${i}`} r={r} />)}
+                      {magicBusy && (
+                        <div className="td-msg td-working">
+                          <div className="td-msg-who">Triage</div>
+                          <div className="td-msg-body">Working on that…</div>
+                        </div>
+                      )}
                     </div>
                   )}
 
-                  {(tab === "drops" || tab === "unsure") && (
-                    <div style={{ marginTop: 16 }}>
-                      <div style={{ fontSize: 9, letterSpacing: ".12em", color: MUTE, fontWeight: 700, marginBottom: 7 }}>
-                        {tab === "unsure" ? "WHICH BUCKET" : "WAS THIS RIGHT"}
+                  {/* One action zone. A pending clarification takes it over;
+                      otherwise it shows whatever this tab can do. Nothing
+                      clickable lives anywhere else. */}
+                  <div className="td-bottom">
+                    {pendingClarify ? (
+                      <>
+                        <div className="td-opts-note">Choose one</div>
+                        {pendingClarify.choices.map((c) => (
+                          <button key={c} className="td-chip-action" disabled={magicBusy} onClick={() => answerClarify(c)}>
+                            {c}
+                          </button>
+                        ))}
+                      </>
+                    ) : tab === "proposals" ? (
+                      <div style={{ padding: "10px 0" }}>
+                        <button className="td-chip-action" disabled={busy} onClick={() => act("proposal", { approve: true })}>
+                          Approve
+                        </button>
+                        <button className="td-chip-action" disabled={busy} onClick={() => act("proposal", { approve: false })}>
+                          Not yet
+                        </button>
                       </div>
-                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    ) : tab === "drops" || tab === "unsure" ? (
+                      <>
+                        <div className="td-opts-note">{tab === "unsure" ? "Which bucket" : "Was this right"}</div>
                         {BUCKETS.map((b) => (
-                          <button key={b.id} disabled={busy} onClick={() => act("bucket", { bucket: b.id })} style={btn("transparent", b.id === "keep-dropped" ? MUTE : b.color, `1px solid ${b.color}`)}>
+                          <button key={b.id} className="td-chip-action" disabled={busy} onClick={() => act("bucket", { bucket: b.id })}>
                             {b.label}
                           </button>
                         ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* The standalone "Park until…" button used to live here.
-                      Removed — "park this until Monday" or "remind me next
-                      week" typed into the magic box now routes through its
-                      quiet shape, which resolves the date and snoozes the
-                      same way this button used to, using the exact same
-                      snooze action underneath. */}
-
-
-                  {tab !== "proposals" && tab !== "drops" && tab !== "unsure" && p?.options?.length > 0 && (
-                    <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 5 }}>
-                      {p.options.map((o) => {
-                        const open = pending?.n === o.n;
-                        // The draft belonging to THIS option — numbered draft
-                        // if 1B wrote one, falling back to the legacy single
-                        // draft for older tickets. Two options never share
-                        // one draft; that was the bug.
-                        const optDraft = p.drafts?.[String(o.n)] || (p.draft ? { text: p.draft, at: p.draftAt, stale: p.stale, legacy: true } : null);
+                      </>
+                    ) : p?.options?.length > 0 ? (
+                      p.options.map((o, i) => {
+                        const d = p.drafts?.[String(o.n)];
                         return (
-                          <div key={o.n}>
-                            <button
-                              disabled={busy}
-                              onClick={() => {
-                                setPending(open ? null : o);
-                                setDraft(optDraft?.text || "");
-                              }}
-                              style={{
-                                ...btn(open ? INK_3 : "transparent", o.manual ? MUTE : PAPER, `1px solid ${open ? accent : INK_3}`),
-                                textAlign: "left",
-                                fontWeight: 400,
-                                padding: "9px 12px",
-                                fontSize: 13,
-                                width: "100%",
-                              }}
-                            >
-                              <span style={{ color: accent, fontWeight: 700, marginRight: 8 }}>{o.n}</span>
+                          <button
+                            key={o.n}
+                            className={`td-opt ${selected === o.n ? "selected" : ""}`}
+                            disabled={busy}
+                            onClick={() => (selected === o.n ? clearSelection() : selectOption(o.n, d?.text || ""))}
+                          >
+                            <span className="n">{i + 1}</span>
+                            <span>
                               {o.text}
-                              {o.manual && <span style={{ fontSize: 9, letterSpacing: ".1em", marginLeft: 8, color: SIGNAL }}>YOU DO THIS</span>}
-                            </button>
-
-                            {open && (
-                              <div style={{ border: `1px solid ${accent}`, borderTop: "none", borderRadius: "0 0 3px 3px", padding: "12px 13px", background: INK }}>
-                                {o.manual ? (
-                                  <p style={{ margin: "0 0 10px", fontSize: 12.5, color: MUTE, lineHeight: 1.55 }}>
-                                    This one is yours to do. Confirming records the choice and closes the
-                                    card — it does not do anything on your behalf.
-                                  </p>
-                                ) : optDraft ? (
-                                  <>
-                                    <div style={{ fontSize: 9, letterSpacing: ".12em", color: MUTE, fontWeight: 700, marginBottom: 6 }}>
-                                      WORDING {optDraft.legacy && <span style={{ color: MUTE }}>· SHARED, PRE-FIX</span>}
-                                      {draft.trim() !== (optDraft.text || "").trim() && <span style={{ color: SIGNAL }}> · EDITED</span>}
-                                      {optDraft.stale && <span style={{ color: ALERT }}> · OVER 48H OLD</span>}
-                                    </div>
-                                    <textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={5} style={box} />
-                                    <p style={{ margin: "7px 0 10px", fontSize: 11.5, color: MUTE, lineHeight: 1.5 }}>
-                                      Emails are prepared as Gmail drafts for you to send. Slack and Linear
-                                      actions go out directly.
-                                    </p>
-                                  </>
-                                ) : (
-                                  <p style={{ margin: "0 0 10px", fontSize: 12.5, color: MUTE, lineHeight: 1.55 }}>
-                                    Nothing to write for this one.
-                                  </p>
-                                )}
-
-                                <div style={{ display: "flex", gap: 6 }}>
-                                  <button
-                                    disabled={busy}
-                                    onClick={() => {
-                                      const edited = optDraft && draft.trim() !== (optDraft.text || "").trim();
-                                      const payload = { n: o.n, draft: edited ? draft : null };
-                                      setPending(null);
-                                      act("choose", payload);
-                                    }}
-                                    style={btn(LIVE, INK)}
-                                  >
-                                    {busy ? "Working…" : o.manual ? "Mark done" : optDraft ? "Confirm and prepare" : "Confirm"}
-                                  </button>
-                                  <button disabled={busy} onClick={() => setPending(null)} style={btn("transparent", MUTE, `1px solid ${INK_3}`)}>
-                                    Cancel
-                                  </button>
-                                </div>
-                              </div>
-                            )}
-                          </div>
+                              {o.manual && <span className="manual-tag">MANUAL</span>}
+                            </span>
+                          </button>
                         );
-                      })}
-                    </div>
-                  )}
+                      })
+                    ) : null}
 
-                  <div style={{ marginTop: 16, borderTop: `1px solid ${INK_3}`, paddingTop: 13 }}>
-                    <div style={{ fontSize: 9, letterSpacing: ".12em", color: MUTE, fontWeight: 700, marginBottom: 8 }}>
-                      TYPE ANYTHING — DELEGATE, REPLY, A NOTE, A QUESTION
-                    </div>
-
-                    {/* One real timeline — everything that's happened on
-                        this ticket, in the order it actually happened.
-                        Sources (for a Routine 5 answer) render as a
-                        collapsible detail on that specific row, same as
-                        before, just no longer split into a separate block
-                        rendered elsewhere on the page. */}
-                    {history.length > 0 && (
-                      <div style={{ marginBottom: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-                        {history.map((row, i) => (
-                          <div key={i} style={{ fontSize: 12, lineHeight: 1.55 }}>
-                            <span style={{ fontSize: 9, letterSpacing: ".08em", color: row.color, fontWeight: 700, marginRight: 6 }}>
-                              {row.label}
-                            </span>
-                            <span style={{ color: row.label === "ASKING YOU" || row.label === "ANSWER" ? PAPER : "#B9C6D2", whiteSpace: "pre-wrap" }}>
-                              {row.body}
-                            </span>
-                            {row.sources?.length > 0 && (
-                              <details style={{ marginTop: 4 }}>
-                                <summary style={{ cursor: "pointer", color: MUTE, fontSize: 11 }}>
-                                  Where this came from ({row.sources.length})
-                                </summary>
-                                <ul style={{ margin: "6px 0 0", paddingLeft: 18, color: MUTE, fontSize: 11.5, lineHeight: 1.6 }}>
-                                  {row.sources.map((sc, j) => (
-                                    <li key={j}>{sc}</li>
-                                  ))}
-                                </ul>
-                              </details>
-                            )}
-                          </div>
-                        ))}
+                    {selected != null && (
+                      <div className="td-context">
+                        {p?.drafts?.[String(selected)] ? (
+                          <>Editing: <span className="to">{p.options.find((x) => x.n === selected)?.text}</span> — send when ready</>
+                        ) : (
+                          <>Confirming: <span className="to">{p.options.find((x) => x.n === selected)?.text}</span> — records the choice, sends nothing</>
+                        )}
+                        <button onClick={clearSelection}>not this</button>
                       </div>
                     )}
 
-                    {asking && <p style={{ fontSize: 12.5, color: COOL, margin: "0 0 10px" }}>Looking into it…</p>}
+                    <div className="td-input-wrap">
+                      <textarea
+                        ref={inputRef}
+                        className="td-input"
+                        rows={1}
+                        placeholder="Reply, delegate, ask, or leave a note"
+                        value={magicText}
+                        onChange={onMagicInput}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) sendFromBox();
+                        }}
+                      />
+                      <button
+                        className={`td-send ${magicText.trim() || selected != null ? "show" : ""}`}
+                        disabled={busy || magicBusy}
+                        onClick={sendFromBox}
+                        aria-label="Send"
+                      >
+                        ↑
+                      </button>
+                    </div>
 
-                    {/* A question with no answer after a few minutes means the
-                        explain routine dropped it — the one piece of
-                        standalone retry UI kept, since a silently dropped
-                        question is a real problem the timeline alone can't
-                        surface. */}
-                    {!asking &&
-                      p?.awaitingAnswer &&
-                      p?.thread?.length > 0 &&
-                      Date.now() - new Date(p.thread[p.thread.length - 1].at).getTime() > 5 * 60 * 1000 && (
-                        <div style={{ marginBottom: 10 }}>
-                          <p style={{ fontSize: 12.5, color: ALERT, margin: "0 0 6px" }}>
-                            That question never got answered.
-                          </p>
-                          <button
-                            onClick={() => ask(p.thread[p.thread.length - 1].body)}
-                            style={btn("transparent", COOL, `1px solid ${COOL}`)}
-                          >
-                            Ask again
-                          </button>
-                        </div>
-                      )}
-
-                    {magicAck && (
-                      <p
+                    {msg && (
+                      <div
                         style={{
-                          fontSize: 12,
-                          color: magicAck.shape === "error" ? ALERT : SIGNAL,
+                          marginTop: 12,
+                          fontSize: 13,
+                          color: msg.ok ? "var(--live)" : "var(--alert)",
                           lineHeight: 1.5,
-                          margin: "0 0 8px",
                         }}
                       >
-                        {magicAck.text}
-                      </p>
-                    )}
-
-                    <textarea
-                      value={magicText}
-                      onChange={(e) => setMagicText(e.target.value)}
-                      rows={2}
-                      placeholder='"Delegate this to Tehreem" · "Already handled, he replied on WhatsApp" · "Remind me in a week"'
-                      style={box}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submitMagic();
-                      }}
-                    />
-                    {magicText.trim() && (
-                      <button disabled={magicBusy} onClick={submitMagic} style={{ ...btn(SIGNAL, INK), marginTop: 7, fontWeight: 700, opacity: magicBusy ? 0.5 : 1 }}>
-                        {magicBusy ? "Working…" : "Send"}
-                      </button>
+                        {msg.text}
+                      </div>
                     )}
                   </div>
-
-                  {msg && (
-                    <div
-                      style={{
-                        marginTop: 12,
-                        padding: "8px 11px",
-                        borderRadius: 3,
-                        fontSize: 12.5,
-                        background: msg.ok ? "rgba(95,201,163,.1)" : "rgba(227,100,79,.12)",
-                        color: msg.ok ? LIVE : ALERT,
-                        border: `1px solid ${msg.ok ? "rgba(95,201,163,.3)" : "rgba(227,100,79,.35)"}`,
-                      }}
-                    >
-                      {msg.text}
-                    </div>
-                  )}
                 </>
               )}
             </article>

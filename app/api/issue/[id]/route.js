@@ -120,7 +120,18 @@ function parse(issue) {
         out.magicThread.push({ kind: "you", body: b.replace(/^FEEDBACK:\s*/i, "").trim(), at: c.createdAt });
       }
       if (/^HELD:/i.test(b)) {
-        out.magicThread.push({ kind: "question", body: b.replace(/^HELD:\s*/i, "").trim(), at: c.createdAt });
+        const raw = b.replace(/^HELD:\s*/i, "").trim();
+        // A HELD: comment may carry a numbered choice list after the
+        // question — split it out into a real array so a page refresh
+        // still renders tappable chips, not a wall of text. Without this,
+        // the choices only ever rendered correctly on the very first
+        // submission (from the direct API response), and silently
+        // degraded to plain text on any reload after that.
+        const lines = raw.split("\n");
+        const choiceStart = lines.findIndex((l) => /^\d+\.\s+/.test(l.trim()));
+        const question = choiceStart > -1 ? lines.slice(0, choiceStart).join("\n").trim() : raw;
+        const choices = choiceStart > -1 ? lines.slice(choiceStart).map((l) => l.replace(/^\d+\.\s*/, "").trim()).filter(Boolean) : [];
+        out.magicThread.push({ kind: "question", body: question, choices, at: c.createdAt });
       }
       if (/^EVIDENCE/i.test(b)) {
         out.magicThread.push({ kind: "resolved", body: b.replace(/^EVIDENCE\s*—?\s*/i, "").trim(), at: c.createdAt });

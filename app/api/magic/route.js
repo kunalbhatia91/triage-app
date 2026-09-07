@@ -40,6 +40,23 @@ function parseOptions(comments) {
   return options;
 }
 
+/* Same shape as parseOptions, needed for a real reason: when supersedes
+   causes surviving options to renumber, their EXISTING drafts (filed under
+   their OLD numbers) would silently orphan unless re-filed under the new
+   ones — drafts are looked up by number, so a number change without a
+   matching draft rewrite breaks the link. Caught this before shipping it,
+   not after. */
+function parseDrafts(comments) {
+  const drafts = {};
+  for (const c of oldestFirst(comments)) {
+    for (const b of sections(c.body)) {
+      const m = b.match(/^DRAFT\s*(\d+)\s*(?:\([^)]*\))?\s*\n([\s\S]*)/i);
+      if (m) drafts[m[1]] = m[2].trim();
+    }
+  }
+  return drafts;
+}
+
 export async function POST(req) {
   try {
     const { issueId, text } = await req.json();
@@ -79,6 +96,7 @@ export async function POST(req) {
       }
     }
     const options = parseOptions(issue.comments);
+    const existingDrafts = parseDrafts(issue.comments);
     // Entities is an enhancement to classification (resolving who "Tehreem"
     // is), not a hard requirement for every interaction — "this is already
     // resolved" needs none of it. A Notion hiccup here shouldn't kill an
@@ -107,12 +125,39 @@ export async function POST(req) {
     const today = new Date().toISOString().slice(0, 10);
 
     if (result.shape === "new_option") {
-      const nextN = (options.length ? Math.max(...options.map((o) => o.n)) : 0) + 1;
-      const allOptions = [...options, { n: nextN, text: result.optionText, manual: false }];
+      // Supersede first, then renumber live — never leave gaps like "1, 3,
+      // 4". A superseded option isn't silently deleted either: it gets a
+      // comment explaining why, same discipline as every other closure in
+      // this system.
+      const supersedes = Array.isArray(result.supersedes) ? result.supersedes : [];
+      const surviving = options.filter((o) => !supersedes.includes(o.n));
+      const allOptions = [...surviving, { text: result.optionText, manual: false, oldN: null }].map((o, i) => ({
+        n: i + 1,
+        oldN: o.oldN !== undefined ? o.oldN : o.n,
+        text: o.text,
+        manual: o.manual,
+      }));
+      const nextN = allOptions.length;
       const optionsBlock = allOptions.map((o) => `${o.n} - ${o.text}${o.manual ? " (MANUAL)" : ""}`).join("\n");
       await addComment(issueId, `OPTIONS\n${optionsBlock}\nReply with a number.`);
+
+      // Any surviving option whose number actually changed needs its
+      // existing draft re-filed under the new number — otherwise the old
+      // draft sits orphaned under a number nothing points to anymore.
+      for (const o of allOptions) {
+        if (o.oldN !== null && o.oldN !== o.n && existingDrafts[String(o.oldN)]) {
+          await addComment(issueId, `DRAFT ${o.n} (${today})\n${existingDrafts[String(o.oldN)]}`);
+        }
+      }
       if (result.draftText) {
         await addComment(issueId, `DRAFT ${nextN} (${today})\n${result.draftText}`);
+      }
+      if (supersedes.length) {
+        const supersededText = options
+          .filter((o) => supersedes.includes(o.n))
+          .map((o) => `"${o.text}"`)
+          .join(", ");
+        await addComment(issueId, `EVIDENCE — Superseded by delegation/new context: ${supersededText}. No longer independent choices now that this exists.`);
       }
       // Tags this ticket for Routine 4 — a sixth correction source, evidence
       // 1B should have predicted this option itself. Requires the label
@@ -123,6 +168,7 @@ export async function POST(req) {
         shape: "new_option",
         acknowledgment: result.acknowledgment,
         newOptionNumber: nextN,
+        superseded: supersedes.length > 0,
       });
     }
 
