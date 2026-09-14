@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/check-stale-dates",
+      "schedule": "0 15 * * *"
+    }
+  ]
+}
