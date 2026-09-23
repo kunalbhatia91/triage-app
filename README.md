@@ -124,3 +124,5 @@ The one rule worth keeping: **no decision logic in this app.** If you find
 yourself adding a rule about which items matter, that rule belongs in the
 Notion Learning Store, where corrections can change it. This app renders and
 records — nothing else.
+
+---
